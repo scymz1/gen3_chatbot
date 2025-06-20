@@ -1,0 +1,11 @@
+huggingface-hub
+fastapi
+uvicorn
+llama-cpp-python
+sqlalchemy
+aiosqlite
+pandas
+requests
+langchain>=0.1.17
+langchain-community>=0.1.17
+langchain-core>=0.1.25
