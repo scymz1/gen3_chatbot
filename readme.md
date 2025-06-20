@@ -55,7 +55,7 @@ This is an intelligent chatbot backend service based on FastAPI and Llama-3, sup
 
 2. **Run the Docker Container**
    ```bash
-   docker run -it --rm -p 8000:8000 chatbot
+   docker run -it --rm   -p 8000:8000   -p 11434:11434 chatbot
    ```
 
 3. **Push to Docker Hub**
