@@ -17,21 +17,7 @@ from langchain.chains.router import MultiPromptChain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableBranch, RunnableMap
 from langchain_core.output_parsers import StrOutputParser
-from fastapi.responses import StreamingResponse
-from time import sleep
-import re
-from typing import List, Optional
-import io
-import contextlib
-import logging
-import sys
 
-logging.basicConfig(
-    level=logging.INFO,  # 或 logging.DEBUG 以查看更多日志
-    stream=sys.stdout,   # 输出到 stdout，这样 kubectl logs 才能抓到
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 # app = FastAPI()
 app = FastAPI(root_path="/chatbot")
@@ -89,7 +75,6 @@ class ChatRequest(BaseModel):
     user_id: str
     conversation_id: str
     question: str
-    guppy_access: Optional[List[str]] = []  # ✅ 新增字段
 
 def truncate_history(messages, max_turns=5):
     """
@@ -101,7 +86,6 @@ def truncate_history(messages, max_turns=5):
     truncated = dialogue_msgs[-max_turns * 2:]  # user + assistant
     return system_msgs + truncated
 
-    
 @app.post("/chat")
 def chat(req: ChatRequest):
     db = SessionLocal()
@@ -122,139 +106,96 @@ def chat(req: ChatRequest):
 
     history_str = "\n".join([f"{m['role']}: {m['content']}" for m in messages[:-1]])
 
-    # 加载数据
+    # ✅ 加载 Guppy 数据
     try:
         case_df = pd.read_json("case_data.json")
-    except:
+    except Exception as e:
+        print("Warning: failed to load case_data.json:", e)
         case_df = pd.DataFrame()
 
     try:
         follow_df = pd.read_json("follow_up_data.json")
-    except:
+    except Exception as e:
+        print("Warning: failed to load follow_up_data.json:", e)
         follow_df = pd.DataFrame()
-
-    if req.guppy_access:
-        # 提取 "Project_demo" 格式的 project_id
-        allowed_project_ids = []
-        for path in req.guppy_access:
-            match = re.match(r"^/programs/([^/]+)/projects/([^/]+)$", path)
-            if match:
-                program, project = match.groups()
-                allowed_project_ids.append(f"{program}-{project}")
-        print('allowed_project_ids', allowed_project_ids)
-        if not case_df.empty and 'project_id' in case_df.columns:
-            case_df = case_df[case_df['project_id'].isin(allowed_project_ids)]
-        else:
-            print("Warning: 'project_id' column missing in case_df")
-            case_df = pd.DataFrame()
-
-        if not follow_df.empty and 'project_id' in follow_df.columns:
-            follow_df = follow_df[follow_df['project_id'].isin(allowed_project_ids)]
-        else:
-            print("Warning: 'project_id' column missing in follow_df")
-            follow_df = pd.DataFrame()
 
     llm = ChatOllama(model="llama3", temperature=0)
 
-    # 分类
+    # Prompt 用于分类问题类型
     router_prompt = ChatPromptTemplate.from_template(
         """You are a biomedical assistant. 
-        Classify the user question into one of the following categories:
-        - structured_query: if it's about patient data, case status, follow-up info, statistics, or anything derived from a dataset
-        - llm_chat: if it's a general biomedical or health knowledge question
+    Classify the user question into one of the following categories:
+    - structured_query: if it's about patient data, case status, follow-up info, statistics, or anything derived from a dataset
+    - llm_chat: if it's a general biomedical or health knowledge question
 
-        Question: {input}
-        Respond only with "structured_query" or "llm_chat".
-        """
+    Question: {input}
+    Respond only with "structured_query" or "llm_chat".
+    """
     )
 
+    # LLM 做分类
     router_chain = router_prompt | llm | StrOutputParser()
 
-    category = router_chain.invoke({"input": req.question}).strip()
-    logger.info('category: %s', category)
-    print('category', category)
+    # 两个子链
+    structured_chain = (
+        PromptTemplate.from_template(
+            "You are a biomedical data analyst. Use the following structured data to answer the user's question.\n\n"
+            "Case data sample:\n{case_preview}\n\n"
+            "Follow-up data sample:\n{follow_preview}\n\n"
+            "Conversation history:\n{history}\n\n"
+            "Question: {input}"
+        )
+        .partial(
+            case_preview=case_df.head(5).to_string(),
+            follow_preview=follow_df.head(5).to_string(),
+            history=history_str
+        )
+        | llm
+        | StrOutputParser()
+    )
 
-    def stream_generator():
-        final_response = ""
-        logger.info('which category: %s', category)
-        if category == "structured_query":
-            code_prompt = PromptTemplate.from_template(
-                """You are a Python data analyst. 
-                You are provided two pandas DataFrames: `case_df` and `follow_df`.
 
-                Here are the first few rows of `case_df`:
-                {case_head}
+    # 用户当前提问
+    current_question = messages[-1]["content"]
 
-                And the first few rows of `follow_df`:
-                {follow_head}
+    chat_prompt = PromptTemplate.from_template(
+        "You are a helpful biomedical assistant.\n"
+        "Conversation history:\n{history}\n\n"
+        "Now continue the conversation. User just asked:\n{input}"
+    )
 
-                Write Python code to answer the following question from the user:
-                {question}
+    llm_chat_chain = LLMChain(
+        llm=llm,
+        prompt=chat_prompt.partial(history=history_str)
+    )
 
-                Wrap the result in `print(...)` so the answer is displayed.
+    # 分类后执行对应子链
+    full_chain = RunnableMap({
+        "input": lambda x: x["input"],
+        "category": lambda x: router_chain.invoke({"input": x["input"]}),
+    }) | RunnableBranch(
+        (lambda x: x["category"] == "structured_query", structured_chain),
+        llm_chat_chain
+    )
 
-                Only return valid Python code. Do not explain. Do not add ```python. Just return code only.
-                """
-            ).partial(
-                case_head=case_df.head(5).to_string(index=False),
-                follow_head=follow_df.head(5).to_string(index=False),
-            )
-            generated_code = llm.invoke(code_prompt.format(question=req.question)).content
-            logger.info("generated_code: %s", generated_code)
-            print('generated_code', generated_code)
-            with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-                local_vars = {"case_df": case_df, "follow_df": follow_df}
-                try:
-                    exec(generated_code, {}, local_vars)
-                except Exception as e:
-                    yield f"[Error executing code: {e}]"
-                    return
-                output = buf.getvalue()
-                print(">> Execution output:", output)
-                logger.info(">> Execution output: %s", output)
+    # 执行 chain（替代原来的 router_chain.run(...)）
+    answer = full_chain.invoke({"input": req.question})
+    messages.append({"role": "assistant", "content": answer})
 
-            explain_prompt = PromptTemplate.from_template(
-                """The result of executing the following Python code is:
+    # ✅ 写入历史
+    if history:
+        history.messages_json = json.dumps(messages)
+    else:
+        db.add(ChatHistory(
+            user_id=req.user_id,
+            conversation_id=req.conversation_id,
+            messages_json=json.dumps(messages)
+        ))
 
-                {output}
+    db.commit()
+    db.close()
 
-                Now explain the answer to the user based on the original question:
-                {question}
-
-                Do not repeat the code. Just give a clear answer.
-                """
-            )
-            explain_response = llm.stream(explain_prompt.format(output=output, question=req.question))
-            for chunk in explain_response:
-                token = chunk.content
-                final_response += token
-                yield token
-
-        else:
-            prompt = (
-                "You are a helpful biomedical assistant.\n"
-                f"Conversation history:\n{history_str}\n\n"
-                f"Now continue the conversation. User just asked:\n{req.question}"
-            )
-            for chunk in llm.stream(prompt):
-                token = chunk.content
-                final_response += token
-                yield token
-
-        messages.append({"role": "assistant", "content": final_response})
-        if history:
-            history.messages_json = json.dumps(messages)
-        else:
-            db.add(ChatHistory(
-                user_id=req.user_id,
-                conversation_id=req.conversation_id,
-                messages_json=json.dumps(messages)
-            ))
-        db.commit()
-        db.close()
-
-    return StreamingResponse(stream_generator(), media_type="text/plain")
-
+    return {"response": answer}
 
 @app.post("/new_conversation")
 def new_conversation(data: dict):

@@ -21,17 +21,6 @@ from fastapi.responses import StreamingResponse
 from time import sleep
 import re
 from typing import List, Optional
-import io
-import contextlib
-import logging
-import sys
-
-logging.basicConfig(
-    level=logging.INFO,  # 或 logging.DEBUG 以查看更多日志
-    stream=sys.stdout,   # 输出到 stdout，这样 kubectl logs 才能抓到
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 # app = FastAPI()
 app = FastAPI(root_path="/chatbot")
@@ -140,19 +129,10 @@ def chat(req: ChatRequest):
             match = re.match(r"^/programs/([^/]+)/projects/([^/]+)$", path)
             if match:
                 program, project = match.groups()
-                allowed_project_ids.append(f"{program}-{project}")
+                allowed_project_ids.append(f"{program}_{project}")
         print('allowed_project_ids', allowed_project_ids)
-        if not case_df.empty and 'project_id' in case_df.columns:
-            case_df = case_df[case_df['project_id'].isin(allowed_project_ids)]
-        else:
-            print("Warning: 'project_id' column missing in case_df")
-            case_df = pd.DataFrame()
-
-        if not follow_df.empty and 'project_id' in follow_df.columns:
-            follow_df = follow_df[follow_df['project_id'].isin(allowed_project_ids)]
-        else:
-            print("Warning: 'project_id' column missing in follow_df")
-            follow_df = pd.DataFrame()
+        case_df = case_df[case_df['project_id'].isin(allowed_project_ids)]
+        follow_df = follow_df[follow_df['project_id'].isin(allowed_project_ids)]
 
     llm = ChatOllama(model="llama3", temperature=0)
 
@@ -171,65 +151,44 @@ def chat(req: ChatRequest):
     router_chain = router_prompt | llm | StrOutputParser()
 
     category = router_chain.invoke({"input": req.question}).strip()
-    logger.info('category: %s', category)
     print('category', category)
 
+    # 🔁 Stream 生成函数（仅对 llm_chat 类型）
     def stream_generator():
         final_response = ""
-        logger.info('which category: %s', category)
         if category == "structured_query":
-            code_prompt = PromptTemplate.from_template(
-                """You are a Python data analyst. 
-                You are provided two pandas DataFrames: `case_df` and `follow_df`.
+            # 静态生成
+            print('case_df', case_df.head(5).to_string())
+            print('follow_df', follow_df.head(5).to_string())
+            # structured_prompt = PromptTemplate.from_template(
+            #     "You are a biomedical data analyst. Use the following structured data to answer the user's question.\n\n"
+            #     "Case data sample:\n{case_preview}\n\n"
+            #     "Follow-up data sample:\n{follow_preview}\n\n"
+            #     "Conversation history:\n{history}\n\n"
+            #     "Question: {input}"
+            # ).partial(
+            #     case_preview=case_df.head(5).to_string(),
+            #     follow_preview=follow_df.head(5).to_string(),
+            #     history=history_str
+            # )
 
-                Here are the first few rows of `case_df`:
-                {case_head}
-
-                And the first few rows of `follow_df`:
-                {follow_head}
-
-                Write Python code to answer the following question from the user:
-                {question}
-
-                Wrap the result in `print(...)` so the answer is displayed.
-
-                Only return valid Python code. Do not explain. Do not add ```python. Just return code only.
-                """
+            structured_prompt = PromptTemplate.from_template(
+                "You are a biomedical data analyst. Use the following structured data to answer the user's question.\n\n"
+                "Case data:\n{case_data}\n\n"
+                "Follow-up data:\n{follow_data}\n\n"
+                "Conversation history:\n{history}\n\n"
+                "Question: {input}"
             ).partial(
-                case_head=case_df.head(5).to_string(index=False),
-                follow_head=follow_df.head(5).to_string(index=False),
+                case_data=case_df.to_string(index=False),
+                follow_data=follow_df.to_string(index=False),
+                history=history_str
             )
-            generated_code = llm.invoke(code_prompt.format(question=req.question)).content
-            logger.info("generated_code: %s", generated_code)
-            print('generated_code', generated_code)
-            with io.StringIO() as buf, contextlib.redirect_stdout(buf):
-                local_vars = {"case_df": case_df, "follow_df": follow_df}
-                try:
-                    exec(generated_code, {}, local_vars)
-                except Exception as e:
-                    yield f"[Error executing code: {e}]"
-                    return
-                output = buf.getvalue()
-                print(">> Execution output:", output)
-                logger.info(">> Execution output: %s", output)
-
-            explain_prompt = PromptTemplate.from_template(
-                """The result of executing the following Python code is:
-
-                {output}
-
-                Now explain the answer to the user based on the original question:
-                {question}
-
-                Do not repeat the code. Just give a clear answer.
-                """
-            )
-            explain_response = llm.stream(explain_prompt.format(output=output, question=req.question))
-            for chunk in explain_response:
+            response = structured_prompt.format(input=req.question)
+            for chunk in llm.stream(response):
                 token = chunk.content
                 final_response += token
+                print('token', token)
                 yield token
-
         else:
             prompt = (
                 "You are a helpful biomedical assistant.\n"
@@ -239,8 +198,10 @@ def chat(req: ChatRequest):
             for chunk in llm.stream(prompt):
                 token = chunk.content
                 final_response += token
+                print('token', token)
                 yield token
 
+        # 写入历史（在流完之后统一存）
         messages.append({"role": "assistant", "content": final_response})
         if history:
             history.messages_json = json.dumps(messages)
@@ -254,7 +215,6 @@ def chat(req: ChatRequest):
         db.close()
 
     return StreamingResponse(stream_generator(), media_type="text/plain")
-
 
 @app.post("/new_conversation")
 def new_conversation(data: dict):
