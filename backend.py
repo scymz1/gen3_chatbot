@@ -10,7 +10,7 @@ from uuid import uuid4
 import requests
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-from langchain_community.chat_models import ChatOllama
+from langchain_community.chat_models import ChatOllama, ChatOpenAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 from langchain.chains.router import MultiPromptChain
@@ -32,6 +32,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# OpenAI API配置
+OPENAI_API_KEY = ""
 
 # app = FastAPI()
 app = FastAPI(root_path="/chatbot")
@@ -102,6 +105,25 @@ def truncate_history(messages, max_turns=5):
     truncated = dialogue_msgs[-max_turns * 2:]  # user + assistant
     return system_msgs + truncated
 
+def create_llm(model_name: str):
+    """
+    根据模型名称创建合适的LLM实例
+    """
+    model_name_lower = model_name.lower()
+    
+    # OpenAI模型
+    if model_name_lower in ["gpt-4", "gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt"]:
+        return ChatOpenAI(
+            model=model_name_lower if model_name_lower != "chatgpt" else "gpt-3.5-turbo",
+            api_key=OPENAI_API_KEY,
+            temperature=0,
+            streaming=True
+        )
+    
+    # Ollama模型
+    else:
+        return ChatOllama(model=model_name, temperature=0)
+
     
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -157,7 +179,7 @@ def chat(req: ChatRequest):
 
     # 使用用户选择的模型，默认为llama3
     selected_model = req.model if req.model else "llama3"
-    llm = ChatOllama(model=selected_model, temperature=0)
+    llm = create_llm(selected_model)
     logger.info('Using model: %s', selected_model)
 
     # 分类
@@ -332,18 +354,27 @@ async def log_path(request, call_next):
 
 @app.get("/available_models")
 def get_available_models():
-    """获取可用的Ollama模型列表"""
+    """获取可用的模型列表"""
+    # OpenAI模型列表
+    openai_models = ["gpt-4", "gpt-3.5-turbo", "gpt-4o", "gpt-4o-mini", "chatgpt"]
+    
     try:
         # 使用requests调用Ollama API获取模型列表
         response = requests.get("http://localhost:11434/api/tags")
         if response.status_code == 200:
             models_data = response.json()
-            models = [model["name"] for model in models_data.get("models", [])]
-            return {"models": models}
+            ollama_models = [model["name"] for model in models_data.get("models", [])]
+            # 合并OpenAI和Ollama模型
+            all_models = openai_models + ollama_models
+            return {"models": all_models}
         else:
             # 如果无法连接到Ollama，返回默认模型列表
-            return {"models": ["llama3", "llama2", "mistral", "codellama", "neural-chat"]}
+            default_ollama_models = ["llama3", "llama2", "mistral", "codellama", "neural-chat"]
+            all_models = openai_models + default_ollama_models
+            return {"models": all_models}
     except Exception as e:
         logger.error(f"Error fetching models from Ollama: {e}")
         # 返回默认模型列表
-        return {"models": ["llama3", "llama2", "mistral", "codellama", "neural-chat"]}
+        default_ollama_models = ["llama3", "llama2", "mistral", "codellama", "neural-chat"]
+        all_models = openai_models + default_ollama_models
+        return {"models": all_models}
