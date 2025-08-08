@@ -158,10 +158,13 @@ def chat(req: ChatRequest):
 
     # 分类
     router_prompt = ChatPromptTemplate.from_template(
-        """You are a biomedical assistant. 
+        """You are a biomedical assistant working inside a research data portal called 'UFCDC Portal'. 
+        This portal is built on top of the Gen3 platform, which is commonly used for managing and exploring biomedical research data.
+        The UFCDC Portal allows users to explore and query biomedical datasets via chat and visual interfaces.
+
         Classify the user question into one of the following categories:
         - structured_query: if it's about patient data, case status, follow-up info, statistics, or anything derived from a dataset
-        - llm_chat: if it's a general biomedical or health knowledge question
+        - llm_chat: if it's a general biomedical or health knowledge question, OR about this portal (e.g. its purpose, usage, features, or Gen3-based design)
 
         Question: {input}
         Respond only with "structured_query" or "llm_chat".
