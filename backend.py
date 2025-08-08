@@ -90,6 +90,7 @@ class ChatRequest(BaseModel):
     conversation_id: str
     question: str
     guppy_access: Optional[List[str]] = []  # ✅ 新增字段
+    model: Optional[str] = "llama3"  # ✅ 新增模型选择字段
 
 def truncate_history(messages, max_turns=5):
     """
@@ -154,7 +155,10 @@ def chat(req: ChatRequest):
             print("Warning: 'project_id' column missing in follow_df")
             follow_df = pd.DataFrame()
 
-    llm = ChatOllama(model="llama3", temperature=0)
+    # 使用用户选择的模型，默认为llama3
+    selected_model = req.model if req.model else "llama3"
+    llm = ChatOllama(model=selected_model, temperature=0)
+    logger.info('Using model: %s', selected_model)
 
     # 分类
     router_prompt = ChatPromptTemplate.from_template(
@@ -322,3 +326,21 @@ def rename_conversation(data: dict = Body(...)):
 async def log_path(request, call_next):
     print(">>> Request path:", request.url.path)
     return await call_next(request)
+
+@app.get("/available_models")
+def get_available_models():
+    """获取可用的Ollama模型列表"""
+    try:
+        # 使用requests调用Ollama API获取模型列表
+        response = requests.get("http://localhost:11434/api/tags")
+        if response.status_code == 200:
+            models_data = response.json()
+            models = [model["name"] for model in models_data.get("models", [])]
+            return {"models": models}
+        else:
+            # 如果无法连接到Ollama，返回默认模型列表
+            return {"models": ["llama3", "llama2", "mistral", "codellama", "neural-chat"]}
+    except Exception as e:
+        logger.error(f"Error fetching models from Ollama: {e}")
+        # 返回默认模型列表
+        return {"models": ["llama3", "llama2", "mistral", "codellama", "neural-chat"]}
